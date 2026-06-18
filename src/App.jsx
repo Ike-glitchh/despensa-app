@@ -49,6 +49,37 @@ async function callClaude(prompt, systemPrompt) {
   return data.content?.map((b) => b.text || "").join("") || "";
 }
 
+async function callClaudeWithImage(base64Image, mediaType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": import.meta.env.VITE_ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1000,
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: mediaType, data: base64Image },
+          },
+          {
+            type: "text",
+            text: `Analiza esta imagen e identifica todos los ingredientes o alimentos que ves. Responde SOLO con JSON válido, sin texto adicional, sin markdown, sin backticks. Formato exacto: [{"name":"nombre en español","qty":1,"unit":"unidades o kg o litros según corresponda","cat":"verduras o carnes o lacteos o abarrotes"}]. Sé específico con los nombres (ej: "Papa amarilla" no solo "Papa"). Si no ves ingredientes claros, devuelve [].`
+          }
+        ],
+      }],
+    }),
+  });
+  const data = await res.json();
+  return data.content?.map((b) => b.text || "").join("") || "";
+}
+
 // ─── Icons ─────────────────────────────────────────────────────────
 const Icon = ({ name, size = 16, color = "currentColor" }) => {
   const paths = {
@@ -66,6 +97,7 @@ const Icon = ({ name, size = 16, color = "currentColor" }) => {
     sparkles: "M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3zM4 17l.75 2.25L7 20l-2.25.75L4 23l-.75-2.25L1 20l2.25-.75L4 17zM19 3l.5 1.5L21 5l-1.5.5L19 7l-.5-1.5L17 5l1.5-.5L19 3z",
     chefhat: "M6 13.87A4 4 0 017.41 6a5.11 5.11 0 0111.18 0A4 4 0 0118 13.87V21H6v-7.13zM6 17h12",
     list: "M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01",
+    camera: "M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2zM12 17a4 4 0 100-8 4 4 0 000 8z",
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
@@ -255,6 +287,9 @@ export default function DespensaApp() {
   const [recipeSearch, setRecipeSearch] = useState("");
   const [recipeSearchResult, setRecipeSearchResult] = useState(null);
   const [recipeSearchLoading, setRecipeSearchLoading] = useState(false);
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanResults, setScanResults] = useState(null);
+  const [showScanConfirm, setShowScanConfirm] = useState(false);
   const [form, setForm] = useState({ name: "", qty: "", unit: "kg", cat: "verduras" });
 
   function update(patch) {
@@ -299,6 +334,44 @@ export default function DespensaApp() {
   }
 
   function deleteItem(id) { update({ items: items.filter((i) => i.id !== id) }); }
+
+  async function scanImage(file) {
+    setScanLoading(true);
+    setScanResults(null);
+    try {
+      const base64 = await new Promise((res, rej) => {
+        const reader = new FileReader();
+        reader.onload = () => res(reader.result.split(",")[1]);
+        reader.onerror = () => rej(new Error("Error leyendo imagen"));
+        reader.readAsDataURL(file);
+      });
+      const mediaType = file.type || "image/jpeg";
+      const text = await callClaudeWithImage(base64, mediaType);
+      const match = text.match(/\[[\s\S]*\]/);
+      const parsed = JSON.parse(match ? match[0] : text);
+      setScanResults(parsed.map(item => ({ ...item, selected: true, max: (item.qty || 1) * 3 })));
+      setShowScanConfirm(true);
+    } catch {
+      alert("No se pudo analizar la imagen. Intenta de nuevo.");
+    }
+    setScanLoading(false);
+  }
+
+  function confirmScan() {
+    const selected = scanResults.filter(i => i.selected);
+    let newItems = [...items];
+    selected.forEach(scanned => {
+      const existing = newItems.find(i => i.name.toLowerCase() === scanned.name.toLowerCase());
+      if (existing) {
+        newItems = newItems.map(i => i.id === existing.id ? { ...i, qty: round(i.qty + (scanned.qty || 1)) } : i);
+      } else {
+        newItems.push({ id: Date.now() + Math.random(), name: scanned.name, qty: scanned.qty || 1, unit: scanned.unit || "unidades", cat: scanned.cat || "abarrotes", max: scanned.max || 3 });
+      }
+    });
+    update({ items: newItems });
+    setShowScanConfirm(false);
+    setScanResults(null);
+  }
 
   async function generateRecipes() {
     setAiLoading(true);
@@ -397,6 +470,11 @@ export default function DespensaApp() {
                 <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: "#9ca3af" }}><Icon name="search" size={16} /></span>
                 <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar ingrediente..." style={{ ...inputStyle, paddingLeft: 36 }} />
               </div>
+              <label style={{ ...btnGhost, display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", padding: "0 14px", cursor: "pointer", opacity: scanLoading ? 0.7 : 1 }}>
+                {scanLoading ? "..." : <><Icon name="camera" size={16} /><span>Foto</span></>}
+                <input type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+                  onChange={(e) => e.target.files[0] && scanImage(e.target.files[0])} disabled={scanLoading} />
+              </label>
               <button onClick={openAdd} style={{ ...btnPrimary, display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", padding: "0 16px" }}>
                 <Icon name="plus" size={16} color="#fff" /> Agregar
               </button>
@@ -696,6 +774,35 @@ export default function DespensaApp() {
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
               <button style={btnGhost} onClick={() => setEditRecipe(null)}>Cancelar</button>
               <button style={btnPrimary} onClick={() => saveEditedRecipe(editRecipe)}>Guardar cambios</button>
+            </div>
+          </>
+        )}
+      </BottomSheet>
+
+      {/* ── SHEET CONFIRMAR ESCANEO ── */}
+      <BottomSheet open={showScanConfirm} onClose={() => setShowScanConfirm(false)} title="Ingredientes detectados">
+        {scanResults && (
+          <>
+            <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 14 }}>Selecciona los que quieres agregar a tu stock:</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+              {scanResults.map((item, i) => (
+                <div key={i} onClick={() => setScanResults(prev => prev.map((r, j) => j === i ? { ...r, selected: !r.selected } : r))}
+                  style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderRadius: 12, border: `1.5px solid ${item.selected ? "#111827" : "#e5e7eb"}`, background: item.selected ? "#f9fafb" : "#fff", cursor: "pointer" }}>
+                  <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${item.selected ? "#111827" : "#d1d5db"}`, background: item.selected ? "#111827" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    {item.selected && <Icon name="check" size={13} color="#fff" />}
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 14, fontWeight: 600, color: "#111827" }}>{item.name}</div>
+                    <div style={{ fontSize: 12, color: "#6b7280" }}>{item.qty} {item.unit} · {CAT_EMOJI[item.cat]} {item.cat}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={btnGhost} onClick={() => setShowScanConfirm(false)}>Cancelar</button>
+              <button style={{ ...btnPrimary, flex: 1 }} onClick={confirmScan}>
+                Agregar {scanResults.filter(i => i.selected).length} ingredientes
+              </button>
             </div>
           </>
         )}
